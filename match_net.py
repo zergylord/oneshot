@@ -4,8 +4,6 @@ cur_time = time.time()
 mb_dim = 32
 x_dim = 28
 y_dim = 5 #5 possible classes
-hid_dim = 200
-enc_dim = 100
 n_samples_per_class = 5 #5 samples of each class
 n_samples = y_dim*n_samples_per_class
 
@@ -15,8 +13,8 @@ data = np.reshape(data,[-1,20,28,28])
 def get_minibatch():
     mb_x_i = np.zeros((mb_dim,n_samples,x_dim,x_dim,1))
     mb_y_i = np.zeros((mb_dim,n_samples))
-    mb_x_hat = np.zeros((mb_dim,x_dim,x_dim,1))
-    mb_y_hat = np.zeros((mb_dim,))
+    mb_x_hat = np.zeros((mb_dim,x_dim,x_dim,1),dtype=np.int)
+    mb_y_hat = np.zeros((mb_dim,),dtype=np.int)
     for i in range(mb_dim):
         ind = 0
         pinds = np.random.permutation(n_samples)
@@ -54,31 +52,42 @@ y_i_ind = tf.placeholder(tf.int32,shape=[None,n_samples])
 y_i = tf.one_hot(y_i_ind,y_dim)
 y_hat_ind = tf.placeholder(tf.int32,shape=[None])
 y_hat = tf.one_hot(y_hat_ind,y_dim)
+eps = 1e-8
 with tf.variable_scope('encode_x_hat'):
     cur_input = x_hat
     cur_filters = 1
     for i in range(4):
         with tf.variable_scope('conv'+str(i)):
             W = tf.get_variable('W',[3,3,cur_filters,64])
+            beta = tf.Variable(tf.constant(0.0,shape=[64]))
+            gamma = tf.Variable(tf.constant(1.0,shape=[64]))
             cur_filters = 64
-            conv = tf.nn.relu(tf.nn.conv2d(cur_input,W,strides=[1,1,1,1],padding='SAME'))
+            pre_norm = tf.nn.conv2d(cur_input,W,strides=[1,1,1,1],padding='SAME')
+            mean,variance = tf.nn.moments(pre_norm,[0,1,2])
+            post_norm = tf.nn.batch_normalization(pre_norm,mean,variance,beta,gamma,eps)
+            conv = tf.nn.relu(post_norm)
             cur_input = tf.nn.max_pool(conv,ksize=[1,2,2,1],strides=[1,2,2,1],padding='VALID')
     x_hat_encode = tf.squeeze(cur_input,[1,2])
-x_hat_inv_mag = tf.rsqrt(tf.reduce_sum(tf.square(x_hat_encode),1,keep_dims=True))
+x_hat_inv_mag = tf.rsqrt(tf.clip_by_value(tf.reduce_sum(tf.square(x_hat_encode),1,keep_dims=True),eps,float("inf")))
 cos_sim_list = []
 with tf.variable_scope('encode_x_i') as varscope:
     for i in range(n_samples):
         if i > 0: varscope.reuse_variables()
-        cur_input = x_hat
+        cur_input = x_i[:,i,:,:,:]
         cur_filters = 1
         for i in range(4):
             with tf.variable_scope('conv'+str(i)):
                 W = tf.get_variable('W',[3,3,cur_filters,64])
+                beta = tf.Variable(tf.constant(0.0,shape=[64]))
+                gamma = tf.Variable(tf.constant(1.0,shape=[64]))
                 cur_filters = 64
-                conv = tf.nn.relu(tf.nn.conv2d(cur_input,W,strides=[1,1,1,1],padding='SAME'))
+                pre_norm = tf.nn.conv2d(cur_input,W,strides=[1,1,1,1],padding='SAME')
+                mean,variance = tf.nn.moments(pre_norm,[0,1,2])
+                post_norm = tf.nn.batch_normalization(pre_norm,mean,variance,beta,gamma,eps)
+                conv = tf.nn.relu(post_norm)
                 cur_input = tf.nn.max_pool(conv,ksize=[1,2,2,1],strides=[1,2,2,1],padding='VALID')
         x_i_encode = tf.squeeze(cur_input,[1,2])
-        x_i_inv_mag = tf.rsqrt(tf.reduce_sum(tf.square(x_i_encode),1,keep_dims=True))
+        x_i_inv_mag = tf.rsqrt(tf.clip_by_value(tf.reduce_sum(tf.square(x_i_encode),1,keep_dims=True),eps,float("inf")))
         dotted = tf.squeeze(
             tf.batch_matmul(tf.expand_dims(x_hat_encode,1),tf.expand_dims(x_i_encode,2)),[1,])
         cos_sim_list.append(dotted
@@ -90,11 +99,13 @@ weighting = tf.nn.softmax(cos_sim)
 label_prob = tf.squeeze(tf.batch_matmul(tf.expand_dims(weighting,1),y_i))
 tf.histogram_summary('label prob',label_prob)
 
-eps = 0
-loss = tf.reduce_mean(-tf.reduce_sum(tf.log(eps+tf.gather(label_prob,y_hat_ind)),1))
+acc = tf.reduce_mean(tf.reduce_sum(label_prob*y_hat,1),0)
+tf.scalar_summary('avg accuracy',acc)
+masked = tf.log(tf.clip_by_value(label_prob,eps,1.0))*y_hat
+correct_prob = tf.reduce_sum(masked,1)
+loss = tf.reduce_mean(-correct_prob,0)
 tf.scalar_summary('loss',loss)
-#train_step = tf.train.AdamOptimizer(1e-4).minimize(loss)
-optim = tf.train.AdamOptimizer(1e-2)
+optim = tf.train.AdamOptimizer(1e-5)
 grads = optim.compute_gradients(loss)
 grad_summaries = [tf.histogram_summary(v.name,g) for g,v in grads]
 train_step = optim.apply_gradients(grads)
@@ -103,21 +114,22 @@ sess = tf.Session()
 merged = tf.merge_all_summaries()
 writer = tf.train.SummaryWriter(FLAGS.summary_dir,sess.graph)
 sess.run(tf.initialize_all_variables())
-for i in range(int(1e5)):
+
+#mb_x_i,mb_y_i,mb_x_hat,mb_y_hat = get_minibatch()
+for i in range(int(1e7)):
     mb_x_i,mb_y_i,mb_x_hat,mb_y_hat = get_minibatch()
     feed_dict = {x_hat: mb_x_hat,
                 y_hat_ind: mb_y_hat,
                 x_i: mb_x_i,
                 y_i_ind: mb_y_i}
-    _,mb_loss,summary = sess.run([train_step,loss,merged],feed_dict=feed_dict)
+    _,mb_loss,summary,ans = sess.run([train_step,loss,merged,cos_sim],feed_dict=feed_dict)
     if i % int(1e2) == 0:
-        print(i,mb_loss,'time: ',time.time()-cur_time)
+        print(i,'loss: ',mb_loss,'time: ',time.time()-cur_time)
         cur_time = time.time()
         run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
         run_metadata = tf.RunMetadata()
         writer.add_run_metadata(run_metadata, 'step%d' % i)
     writer.add_summary(summary,i)
-
 
 
 
