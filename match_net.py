@@ -9,7 +9,7 @@ n_samples = y_dim*n_samples_per_class
 eps = 1e-10
 tie = False
 x_i_learn = True
-learning_rate = 1e-5
+learning_rate = 1e-3 #1e-1
 
 data = np.load('data.npy')
 data = np.reshape(data,[-1,20,28,28])
@@ -88,8 +88,8 @@ for i in range(n_samples):
     dotted = tf.squeeze(
         tf.batch_matmul(tf.expand_dims(x_hat_encode,1),tf.expand_dims(x_i_encode,2)),[1,])
     cos_sim_list.append(dotted
-            *x_hat_inv_mag
             *x_i_inv_mag)
+            #*x_hat_inv_mag
 cos_sim = tf.concat(1,cos_sim_list)
 tf.histogram_summary('cos sim',cos_sim)
 weighting = tf.nn.softmax(cos_sim)
@@ -104,6 +104,7 @@ masked = tf.log(tf.clip_by_value(label_prob,eps,1.0))*y_hat
 correct_prob = tf.reduce_sum(masked,1)
 loss = tf.reduce_mean(-correct_prob,0)
 tf.scalar_summary('loss',loss)
+#optim = tf.train.GradientDescentOptimizer(learning_rate)
 optim = tf.train.AdamOptimizer(learning_rate)
 grads = optim.compute_gradients(loss)
 #grad_summaries = [tf.histogram_summary(v.name,g) for g,v in grads]
