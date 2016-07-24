@@ -3,7 +3,7 @@ import time
 cur_time = time.time()
 mb_dim = 32 #training examples per minibatch
 x_dim = 28  #size of one side of square image
-y_dim = 20  #possible classes
+y_dim = 5  #possible classes
 n_samples_per_class = 1 #samples of each class
 n_samples = y_dim*n_samples_per_class #total number of labeled samples
 eps = 1e-10 #term added for numerical stability of log computations
@@ -13,6 +13,9 @@ learning_rate = 1e-1
 
 data = np.load('data.npy')
 data = np.reshape(data,[-1,20,28,28]) #each of the 1600 classes has 20 examples
+data = np.random.permutation(data)
+train_data = data[:1200,:,:,:]
+test_data = data[1200:,:,:,:]
 
 '''
     Samples a minibatch of size mb_dim. Each training example contains
@@ -21,7 +24,12 @@ data = np.reshape(data,[-1,20,28,28]) #each of the 1600 classes has 20 examples
     one one of these classes is then chosen to be the query, and its label
     is the target of the network.
 '''
-def get_minibatch():
+def get_minibatch(test=False):
+    if test:
+        cur_data = test_data
+        print('testing')
+    else:
+        cur_data = train_data
     mb_x_i = np.zeros((mb_dim,n_samples,x_dim,x_dim,1))
     mb_y_i = np.zeros((mb_dim,n_samples))
     mb_x_hat = np.zeros((mb_dim,x_dim,x_dim,1),dtype=np.int)
@@ -29,16 +37,16 @@ def get_minibatch():
     for i in range(mb_dim):
         ind = 0
         pinds = np.random.permutation(n_samples)
-        classes = np.random.choice(data.shape[0],y_dim,False)
+        classes = np.random.choice(cur_data.shape[0],y_dim,False)
         x_hat_class = np.random.randint(y_dim)
         for j,cur_class in enumerate(classes): #each class
-            example_inds = np.random.choice(data.shape[1],n_samples_per_class,False)
+            example_inds = np.random.choice(cur_data.shape[1],n_samples_per_class,False)
             for eind in example_inds:
-                mb_x_i[i,pinds[ind],:,:,0] = np.rot90(data[cur_class][eind],np.random.randint(4))
+                mb_x_i[i,pinds[ind],:,:,0] = np.rot90(cur_data[cur_class][eind],np.random.randint(4))
                 mb_y_i[i,pinds[ind]] = j
                 ind +=1
             if j == x_hat_class:
-                mb_x_hat[i,:,:,0] = np.rot90(data[cur_class][np.random.choice(data.shape[1])],np.random.randint(4))
+                mb_x_hat[i,:,:,0] = np.rot90(cur_data[cur_class][np.random.choice(cur_data.shape[1])],np.random.randint(4))
                 mb_y_hat[i] = j
     return mb_x_i,mb_y_i,mb_x_hat,mb_y_hat
 
@@ -118,7 +126,7 @@ tf.histogram_summary('label prob',label_prob)
 
 top_k = tf.nn.in_top_k(label_prob,y_hat_ind,1)
 acc = tf.reduce_mean(tf.to_float(top_k))
-tf.scalar_summary('avg accuracy',acc)
+tf.scalar_summary('train avg accuracy',acc)
 correct_prob = tf.reduce_sum(tf.log(tf.clip_by_value(label_prob,eps,1.0))*y_hat,1)
 loss = tf.reduce_mean(-correct_prob,0)
 tf.scalar_summary('loss',loss)
@@ -128,12 +136,17 @@ grads = optim.compute_gradients(loss)
 grad_summaries = [tf.histogram_summary(v.name,g) if g is not None else '' for g,v in grads]
 train_step = optim.apply_gradients(grads)
 
+#testing stuff
+test_acc = tf.reduce_mean(tf.to_float(top_k))
+
+
 '''
     End of the construction of the computational graph. The remaining code runs training steps.
 '''
 
 sess = tf.Session()
 merged = tf.merge_all_summaries()
+test_summ = tf.scalar_summary('test avg accuracy',test_acc)
 writer = tf.train.SummaryWriter(FLAGS.summary_dir,sess.graph)
 sess.run(tf.initialize_all_variables())
 
@@ -145,6 +158,13 @@ for i in range(int(1e7)):
                 y_i_ind: mb_y_i}
     _,mb_loss,summary,ans = sess.run([train_step,loss,merged,cos_sim],feed_dict=feed_dict)
     if i % int(1e2) == 0:
+        mb_x_i,mb_y_i,mb_x_hat,mb_y_hat = get_minibatch(True)
+        feed_dict = {x_hat: mb_x_hat,
+                    y_hat_ind: mb_y_hat,
+                    x_i: mb_x_i,
+                    y_i_ind: mb_y_i}
+        _,test_summary = sess.run([test_acc,test_summ],feed_dict=feed_dict)
+        writer.add_summary(test_summary,i)
         print(i,'loss: ',mb_loss,'time: ',time.time()-cur_time)
         cur_time = time.time()
         run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
