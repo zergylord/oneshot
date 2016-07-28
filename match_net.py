@@ -86,8 +86,8 @@ def make_conv_net(inp,scope,reuse=False,stop_grad=False):
         for i in range(4):
             with tf.variable_scope('conv'+str(i)):
                 W = tf.get_variable('W',[3,3,cur_filters,64])
-                beta = tf.Variable(tf.constant(0.0,shape=[64]))
-                gamma = tf.Variable(tf.constant(1.0,shape=[64]))
+                beta = tf.get_variable('beta',[64],initializer=tf.constant_initializer(0.0))
+                gamma = tf.get_variable('gamma',[64],initializer=tf.constant_initializer(1.0))
                 cur_filters = 64
                 pre_norm = tf.nn.conv2d(cur_input,W,strides=[1,1,1,1],padding='SAME')
                 mean,variance = tf.nn.moments(pre_norm,[0,1,2])
@@ -149,7 +149,6 @@ merged = tf.merge_all_summaries()
 test_summ = tf.scalar_summary('test avg accuracy',test_acc)
 writer = tf.train.SummaryWriter(FLAGS.summary_dir,sess.graph)
 sess.run(tf.initialize_all_variables())
-
 for i in range(int(1e7)):
     mb_x_i,mb_y_i,mb_x_hat,mb_y_hat = get_minibatch()
     feed_dict = {x_hat: mb_x_hat,
@@ -171,6 +170,3 @@ for i in range(int(1e7)):
         run_metadata = tf.RunMetadata()
         writer.add_run_metadata(run_metadata, 'step%d' % i)
     writer.add_summary(summary,i)
-
-
-
