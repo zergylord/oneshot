@@ -1,3 +1,4 @@
+#TODO: add some dummy data in S,R,mem_ind, and see if it runs
 '''
 matching network architecture applied to model-free episodic control.
 
@@ -8,17 +9,31 @@ Stores seperate memory bank for each action, so inference must be performed seve
 per action selection.
 '''
 from grid_env import * 
+from ops import *
 import numpy as np
 import time
 cur_time = time.time()
-env = FourRooms(9)
+env = FourRooms(9)#size of one side of square image
 mb_dim = 32 #training examples per minibatch
-x_dim = env.observation_space.shape[0]  #size of one side of square image
-y_dim = env.action_space.n  #possible classes
+hid_dim = 10
+out_dim = 64
+x_dim = env.observation_space.shape[0]  
+n_act = env.action_space.n
 eps = 1e-10 #term added for numerical stability of log computations
 tie = False #tie the weights of the query network to the labeled network
 x_i_learn = True #toggle learning for the query network
 learning_rate = 1e-1
+warming_steps = 250
+'''
+setup episodic memory
+'''
+mem_size = int(1e3)
+S = np.zeros((n_act,mem_size,out_dim))
+R = np.zeros((n_act,mem_size,))
+#usage normally strictly positive, initialization ensures memory bank fills up in order
+usage = np.tile(np.asarray(range(-mem_size,0)),[n_act,1])
+mem_ind = np.zeros((n_act,),dtype=int)
+
 
 
 '''
@@ -27,30 +42,19 @@ and predict its Return based on other random samples from the same bank.
 
 Perhaps the samples chosen should be weighted by their usage?
 '''
-def get_minibatch(test=False):
-    if test:
-        cur_data = test_data
-        print('testing')
-    else:
-        cur_data = train_data
-    mb_x_i = np.zeros((mb_dim,n_samples,x_dim,x_dim,1))
+def get_minibatch():
+    a = np.random.randint(n_act)
+    mb_x_i = np.zeros((mb_dim,n_samplies,x_dim))
     mb_y_i = np.zeros((mb_dim,n_samples))
-    mb_x_hat = np.zeros((mb_dim,x_dim,x_dim,1),dtype=np.int)
-    mb_y_hat = np.zeros((mb_dim,),dtype=np.int)
+    mb_x_hat = np.zeros((mb_dim,x_dim))
+    mb_y_hat = np.zeros((mb_dim,))
+    
     for i in range(mb_dim):
-        ind = 0
-        pinds = np.random.permutation(n_samples)
-        classes = np.random.choice(cur_data.shape[0],y_dim,False)
-        x_hat_class = np.random.randint(y_dim)
-        for j,cur_class in enumerate(classes): #each class
-            example_inds = np.random.choice(cur_data.shape[1],n_samples_per_class,False)
-            for eind in example_inds:
-                mb_x_i[i,pinds[ind],:,:,0] = np.rot90(cur_data[cur_class][eind],np.random.randint(4))
-                mb_y_i[i,pinds[ind]] = j
-                ind +=1
-            if j == x_hat_class:
-                mb_x_hat[i,:,:,0] = np.rot90(cur_data[cur_class][np.random.choice(cur_data.shape[1])],np.random.randint(4))
-                mb_y_hat[i] = j
+        example_inds = np.random.choice(mem_ind[a],n_samples,False)
+        mb_x_hat[i] = S[a][example_inds[0]]
+        mb_y_hat[i] = R[a][example_inds[0]]
+        mb_x_i[i] = S[a][example_inds[1:]]
+        mb_y_i[i] = R[a][example_inds[1:]]
     return mb_x_i,mb_y_i,mb_x_hat,mb_y_hat
 
 
@@ -68,64 +72,61 @@ if tf.gfile.Exists(FLAGS.summary_dir):
     tf.gfile.MakeDirs(FLAGS.summary_dir)
 
 
-x_hat = tf.placeholder(tf.float32,shape=[None,x_dim,x_dim,1])
-x_i = tf.placeholder(tf.float32,shape=[None,n_samples,x_dim,x_dim,1])
-y_i_ind = tf.placeholder(tf.int32,shape=[None,n_samples])
-y_i = tf.one_hot(y_i_ind,y_dim)
-y_hat_ind = tf.placeholder(tf.int32,shape=[None])
-y_hat = tf.one_hot(y_hat_ind,y_dim)
 '''
-    creates a stack of 4 layers. Each layer contains a
-    3x3 conv layers, batch normalization, retified activation,
-    and then 2x2 max pooling. The net effect is to tranform the
-    mb_dimx28x28x1 images into a mb_dimx1x1x64 embedding, the extra
-    dims are removed, resulting in mb_dimx64.
+    basic feedforward network
 '''
-def make_conv_net(inp,scope,reuse=False,stop_grad=False):
+def make_net(inp,scope,reuse=False,stop_grad=False):
     with tf.variable_scope(scope) as varscope:
         if reuse: varscope.reuse_variables()
-        cur_input = inp
-        cur_filters = 1
-        for i in range(4):
-            with tf.variable_scope('conv'+str(i)):
-                W = tf.get_variable('W',[3,3,cur_filters,64])
-                beta = tf.get_variable('beta',[64],initializer=tf.constant_initializer(0.0))
-                gamma = tf.get_variable('gamma',[64],initializer=tf.constant_initializer(1.0))
-                cur_filters = 64
-                pre_norm = tf.nn.conv2d(cur_input,W,strides=[1,1,1,1],padding='SAME')
-                mean,variance = tf.nn.moments(pre_norm,[0,1,2])
-                post_norm = tf.nn.batch_normalization(pre_norm,mean,variance,beta,gamma,eps)
-                conv = tf.nn.relu(post_norm)
-                cur_input = tf.nn.max_pool(conv,ksize=[1,2,2,1],strides=[1,2,2,1],padding='VALID')
+        hid = linear(inp,hid_dim,'ff0',tf.nn.relu)
+        output = linear(hid,out_dim,'ff1')
     if stop_grad:
-        return tf.stop_gradient(tf.squeeze(cur_input,[1,2]))
+        return tf.stop_gradient(output)
     else:
-        return tf.squeeze(cur_input,[1,2])
+        return output
 '''
     assemble a computational graph for processing minibatches of the n_samples labeled examples and one unlabeled sample.
     All labeled examples use the same convolutional network, whereas the unlabeled sample defaults to using different parameters.
     After using the convolutional networks to encode the input, the pairwise cos similarity is computed. The normalized version of this
     is used to weight each label's contribution to the queried label prediction.
 '''
+'''
+inference graph
+'''
+x_hat = tf.placeholder(tf.float32,shape=[1,x_dim])
+y_hat = tf.placeholder(tf.float32,shape=[1])
+x_i = tf.placeholder(tf.float32,shape=[n_act,None,1,x_dim])
+y_i = tf.placeholder(tf.float32,shape=[n_act,None])
 scope = 'encode_x'
-x_hat_encode = make_conv_net(x_hat,scope)
+x_hat_encode = make_net(x_hat,scope)
 #x_hat_inv_mag = tf.rsqrt(tf.clip_by_value(tf.reduce_sum(tf.square(x_hat_encode),1,keep_dims=True),eps,float("inf")))
 cos_sim_list = []
-if not tie:
-    scope = 'encode_x_i'
-for i in range(n_samples):
-    x_i_encode = make_conv_net(x_i[:,i,:,:,:],scope,tie or i > 0,not x_i_learn)
-    x_i_inv_mag = tf.rsqrt(tf.clip_by_value(tf.reduce_sum(tf.square(x_i_encode),1,keep_dims=True),eps,float("inf")))
-    dotted = tf.squeeze(
-        tf.batch_matmul(tf.expand_dims(x_hat_encode,1),tf.expand_dims(x_i_encode,2)),[1,])
-    cos_sim_list.append(dotted
-            *x_i_inv_mag)
-            #*x_hat_inv_mag
-cos_sim = tf.concat(1,cos_sim_list)
-tf.histogram_summary('cos sim',cos_sim)
-weighting = tf.nn.softmax(cos_sim)
-label_prob = tf.squeeze(tf.batch_matmul(tf.expand_dims(weighting,1),y_i))
-tf.histogram_summary('label prob',label_prob)
+cos_sim = []
+for a in range(n_act):
+    cos_sim_list.append([])
+    if not tie:
+        scope = 'encode_x_i_' + str(a)
+    for i in range(mem_ind[a]):
+        x_i_encode = make_net(x_i[a,i],scope,tie or i > 0,not x_i_learn)
+        x_i_inv_mag = tf.rsqrt(tf.clip_by_value(tf.reduce_sum(tf.square(x_i_encode),1,keep_dims=True),eps,float("inf")))
+        dotted = tf.squeeze(
+            tf.matmul(tf.expand_dims(x_hat_encode,0),tf.expand_dims(x_i_encode,1)))
+        cos_sim_list[a].append(dotted
+                *x_i_inv_mag)
+                #*x_hat_inv__mag
+    cos_sim.append(tf.concat(1,cos_sim_list[a]))
+    tf.histogram_summary('cos sim_'+str(a),cos_sim[a])
+    weighting = tf.nn.softmax(cos_sim[a])
+    return_pred.append(tf.squeeze(tf.matmul(tf.expand_dims(weighting,0),tf.expand_dim(y_i[a],1))))
+    tf.histogram_summary('return pred' + str(a),return_pred[a])
+q_values = tf.concat(return_pred,1)
+
+'''
+train graph
+x_hat = tf.placeholder(tf.float32,shape=[None,x_dim])
+y_hat = tf.placeholder(tf.float32,shape=[None])
+x_i = tf.placeholder(tf.float32,shape=[None,None,x_dim])
+y_i = tf.placeholder(tf.float32,shape=[None,None])
 
 top_k = tf.nn.in_top_k(label_prob,y_hat_ind,1)
 acc = tf.reduce_mean(tf.to_float(top_k))
@@ -141,7 +142,7 @@ train_step = optim.apply_gradients(grads)
 
 #testing stuff
 test_acc = tf.reduce_mean(tf.to_float(top_k))
-
+'''
 
 '''
     End of the construction of the computational graph. The remaining code runs training steps.
@@ -149,10 +150,17 @@ test_acc = tf.reduce_mean(tf.to_float(top_k))
 
 sess = tf.Session()
 merged = tf.merge_all_summaries()
-test_summ = tf.scalar_summary('test avg accuracy',test_acc)
 writer = tf.train.SummaryWriter(FLAGS.summary_dir,sess.graph)
 sess.run(tf.initialize_all_variables())
 for i in range(int(1e7)):
+    s,r,done,_ = env.step(env.action_space.sample())
+    if i >= warming_steps:
+        qvals,summary,sim = sess.run([q_values,merged,cos_sim],feed_dict=feed_dict)
+    if done:
+        :
+    '''
+    execute training step:
+
     mb_x_i,mb_y_i,mb_x_hat,mb_y_hat = get_minibatch()
     feed_dict = {x_hat: mb_x_hat,
                 y_hat_ind: mb_y_hat,
@@ -160,16 +168,10 @@ for i in range(int(1e7)):
                 y_i_ind: mb_y_i}
     _,mb_loss,summary,ans = sess.run([train_step,loss,merged,cos_sim],feed_dict=feed_dict)
     if i % int(1e2) == 0:
-        mb_x_i,mb_y_i,mb_x_hat,mb_y_hat = get_minibatch(True)
-        feed_dict = {x_hat: mb_x_hat,
-                    y_hat_ind: mb_y_hat,
-                    x_i: mb_x_i,
-                    y_i_ind: mb_y_i}
-        _,test_summary = sess.run([test_acc,test_summ],feed_dict=feed_dict)
-        writer.add_summary(test_summary,i)
         print(i,'loss: ',mb_loss,'time: ',time.time()-cur_time)
         cur_time = time.time()
         run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
         run_metadata = tf.RunMetadata()
         writer.add_run_metadata(run_metadata, 'step%d' % i)
     writer.add_summary(summary,i)
+    '''
