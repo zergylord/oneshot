@@ -7,11 +7,11 @@
 import numpy as np
 import time
 cur_time = time.time()
-mb_dim = 2 #training examples per minibatch
+mb_dim = 32 #training examples per minibatch
 x_dim = 28  #size of one side of square image
-y_dim = 3  #possible classes
-n_samples_per_class = 1 #samples of each class
-n_samples = y_dim*20-1 #total number of labeled samples
+y_dim = 30  #possible classes
+n_samples_per_class = 3 #samples of each class 1-19
+n_samples = y_dim*n_samples_per_class #total number of labeled samples
 eps = 1e-10 #term added for numerical stability of log computations
 tie = False #tie the weights of the query network to the labeled network
 x_i_learn = True #toggle learning for the query network
@@ -42,15 +42,13 @@ def get_minibatch():
         pii = 0
         range_list = list(range(20))
         for j in range(y_dim):
+            possible = cur_data[j,range_list != x_hat_ind,:,:]
+            pos_inds = np.random.permutation(19)
+            mb_x_i[i][pinds[pii:pii+n_samples_per_class],:,:,0] = possible[pos_inds[n_samples_per_class]]
+            mb_y_i[i][pinds[pii:pii+n_samples_per_class]] = j
+            pii+=n_samples_per_class
             if j == x_hat_class:
-                mb_x_i[i][pinds[pii:pii+19],:,:,0] = cur_data[j,range_list != x_hat_ind,:,:]
-                mb_y_i[i][pinds[pii:pii+19]] = j
                 mb_x_hat[i,:,:,0] = cur_data[j,x_hat_ind,:,:]
-                pii+=19
-            else:
-                mb_x_i[i][pinds[pii:pii+20],:,:,0] = cur_data[j,:,:,:]
-                mb_y_i[i][pinds[pii:pii+20]] = j
-                pii+=20
     return mb_x_i,mb_y_i,mb_x_hat,mb_y_hat
 
 
