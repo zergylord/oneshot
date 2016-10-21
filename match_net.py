@@ -7,7 +7,7 @@ y_dim = 5  #possible classes
 n_samples_per_class = 1 #samples of each class
 n_samples = y_dim*n_samples_per_class #total number of labeled samples
 eps = 1e-10 #term added for numerical stability of log computations
-tie = False #tie the weights of the query network to the labeled network
+tie = True #tie the weights of the query network to the labeled network
 x_i_learn = True #toggle learning for the query network
 learning_rate = 1e-1
 
