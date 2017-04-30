@@ -1,6 +1,8 @@
 import numpy as np
 import time
 cur_time = time.time()
+use_conv = False
+refresh = 1e3
 mb_dim = 32 #training examples per minibatch
 x_dim = 28  #size of one side of square image
 y_dim = 5  #possible classes
@@ -9,7 +11,7 @@ n_samples = y_dim*n_samples_per_class #total number of labeled samples
 eps = 1e-10 #term added for numerical stability of log computations
 tie = False #tie the weights of the query network to the labeled network
 x_i_learn = True #toggle learning for the query network
-learning_rate = 1e-1
+learning_rate = 4e-5 #1e-1
 
 data = np.load('data.npy')
 data = np.reshape(data,[-1,20,28,28]) #each of the 1600 classes has 20 examples
@@ -98,6 +100,16 @@ def make_conv_net(inp,scope,reuse=False,stop_grad=False):
         return tf.stop_gradient(tf.squeeze(cur_input,[1,2]))
     else:
         return tf.squeeze(cur_input,[1,2])
+def make_dense_net(inp,scope,reuse=False,stop_grad=False):
+    with tf.variable_scope(scope) as varscope:
+        if reuse: varscope.reuse_variables()
+        cur_input = tf.contrib.layers.flatten(inp)
+        hid = tf.layers.dense(cur_input,1000,activation = tf.nn.relu)
+        output = tf.layers.dense(hid,64)
+    if stop_grad:
+        return tf.stop_gradient(output)
+    else:
+        return output
 '''
     assemble a computational graph for processing minibatches of the n_samples labeled examples and one unlabeled sample.
     All labeled examples use the same convolutional network, whereas the unlabeled sample defaults to using different parameters.
@@ -105,35 +117,41 @@ def make_conv_net(inp,scope,reuse=False,stop_grad=False):
     is used to weight each label's contribution to the queried label prediction.
 '''
 scope = 'encode_x'
-x_hat_encode = make_conv_net(x_hat,scope)
+if use_conv:
+    x_hat_encode = make_conv_net(x_hat,scope)
+else:
+    x_hat_encode = make_dense_net(x_hat,scope)
 #x_hat_inv_mag = tf.rsqrt(tf.clip_by_value(tf.reduce_sum(tf.square(x_hat_encode),1,keep_dims=True),eps,float("inf")))
 cos_sim_list = []
 if not tie:
     scope = 'encode_x_i'
 for i in range(n_samples):
-    x_i_encode = make_conv_net(x_i[:,i,:,:,:],scope,tie or i > 0,not x_i_learn)
+    if use_conv:
+        x_i_encode = make_conv_net(x_i[:,i,:,:,:],scope,tie or i > 0,not x_i_learn)
+    else:
+        x_i_encode = make_dense_net(x_i[:,i,:,:,:],scope,tie or i > 0,not x_i_learn)
     x_i_inv_mag = tf.rsqrt(tf.clip_by_value(tf.reduce_sum(tf.square(x_i_encode),1,keep_dims=True),eps,float("inf")))
     dotted = tf.squeeze(
-        tf.batch_matmul(tf.expand_dims(x_hat_encode,1),tf.expand_dims(x_i_encode,2)),[1,])
+        tf.matmul(tf.expand_dims(x_hat_encode,1),tf.expand_dims(x_i_encode,2)),[1,])
     cos_sim_list.append(dotted
             *x_i_inv_mag)
             #*x_hat_inv_mag
-cos_sim = tf.concat(1,cos_sim_list)
-tf.histogram_summary('cos sim',cos_sim)
+cos_sim = tf.concat(axis=1,values=cos_sim_list)
+tf.summary.histogram('cos sim',cos_sim)
 weighting = tf.nn.softmax(cos_sim)
-label_prob = tf.squeeze(tf.batch_matmul(tf.expand_dims(weighting,1),y_i))
-tf.histogram_summary('label prob',label_prob)
+label_prob = tf.squeeze(tf.matmul(tf.expand_dims(weighting,1),y_i))
+tf.summary.histogram('label prob',label_prob)
 
 top_k = tf.nn.in_top_k(label_prob,y_hat_ind,1)
 acc = tf.reduce_mean(tf.to_float(top_k))
-tf.scalar_summary('train avg accuracy',acc)
+tf.summary.scalar('train avg accuracy',acc)
 correct_prob = tf.reduce_sum(tf.log(tf.clip_by_value(label_prob,eps,1.0))*y_hat,1)
 loss = tf.reduce_mean(-correct_prob,0)
-tf.scalar_summary('loss',loss)
-optim = tf.train.GradientDescentOptimizer(learning_rate)
-#optim = tf.train.AdamOptimizer(learning_rate)
+tf.summary.scalar('loss',loss)
+#optim = tf.train.GradientDescentOptimizer(learning_rate)
+optim = tf.train.AdamOptimizer(learning_rate)
 grads = optim.compute_gradients(loss)
-grad_summaries = [tf.histogram_summary(v.name,g) if g is not None else '' for g,v in grads]
+grad_summaries = [tf.summary.histogram(v.name,g) if g is not None else '' for g,v in grads]
 train_step = optim.apply_gradients(grads)
 
 #testing stuff
@@ -144,11 +162,14 @@ test_acc = tf.reduce_mean(tf.to_float(top_k))
     End of the construction of the computational graph. The remaining code runs training steps.
 '''
 
-sess = tf.Session()
-merged = tf.merge_all_summaries()
-test_summ = tf.scalar_summary('test avg accuracy',test_acc)
-writer = tf.train.SummaryWriter(FLAGS.summary_dir,sess.graph)
-sess.run(tf.initialize_all_variables())
+sess_config = tf.ConfigProto()
+sess_config.gpu_options.allow_growth = True
+sess_config.allow_soft_placement=True
+sess = tf.Session(config=sess_config)
+merged = tf.summary.merge_all()
+test_summ = tf.summary.scalar('test avg accuracy',test_acc)
+writer = tf.summary.FileWriter(FLAGS.summary_dir,sess.graph)
+sess.run(tf.global_variables_initializer())
 for i in range(int(1e7)):
     mb_x_i,mb_y_i,mb_x_hat,mb_y_hat = get_minibatch()
     feed_dict = {x_hat: mb_x_hat,
@@ -156,15 +177,15 @@ for i in range(int(1e7)):
                 x_i: mb_x_i,
                 y_i_ind: mb_y_i}
     _,mb_loss,summary,ans = sess.run([train_step,loss,merged,cos_sim],feed_dict=feed_dict)
-    if i % int(1e2) == 0:
+    if i % int(refresh) == 0:
         mb_x_i,mb_y_i,mb_x_hat,mb_y_hat = get_minibatch(True)
         feed_dict = {x_hat: mb_x_hat,
                     y_hat_ind: mb_y_hat,
                     x_i: mb_x_i,
                     y_i_ind: mb_y_i}
-        _,test_summary = sess.run([test_acc,test_summ],feed_dict=feed_dict)
+        cur_acc,test_summary = sess.run([test_acc,test_summ],feed_dict=feed_dict)
         writer.add_summary(test_summary,i)
-        print(i,'loss: ',mb_loss,'time: ',time.time()-cur_time)
+        print(i,'acc: ',cur_acc,'loss: ',mb_loss,'time: ',time.time()-cur_time)
         cur_time = time.time()
         run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
         run_metadata = tf.RunMetadata()
